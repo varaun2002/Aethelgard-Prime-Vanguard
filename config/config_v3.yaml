@@ -1,0 +1,35 @@
+version: "3.0"
+
+features:
+  technical_features: 50
+  external_features: 20
+  total_features: 70
+
+model:
+  architecture: "HybridTransformerGRU"
+  input_dim: 70
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+
+external_data:
+  cache_duration:
+    btc_data: 300        # 5 minutes
+    funding_rate: 3600   # 1 hour
+    fear_greed: 3600     # 1 hour
+    stock_data: 3600     # 1 hour
+  
+  fallback_values:
+    btc_return: 0.0
+    btc_volatility: 0.02
+    correlation: 0.7
+    funding_rate: 0.0001
+    fear_greed: 50
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 100
+  validation_split: 0.2
+
+timeframes: ["15m", "1h", "4h"]

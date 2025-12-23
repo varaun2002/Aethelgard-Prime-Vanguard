@@ -1,0 +1,19 @@
+# Existing dependencies
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# NEW for V3.0 external factors
+ccxt>=4.0.0           # Crypto exchange API
+yfinance>=0.2.0       # Stock market data
+requests>=2.31.0      # HTTP requests
+pytz>=2023.3          # Timezone handling
+
+# Training
+tqdm>=4.65.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+pandas-ta>=0.3.14b0     # Added for technical indicators
+streamlit>=1.25.0
+plotly>=5.15.0
