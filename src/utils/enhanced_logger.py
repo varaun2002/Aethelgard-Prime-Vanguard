@@ -35,6 +35,8 @@ class EnhancedLogger:
             'timestamp',
             'date',
             'timeframe',
+            'symbol',
+            'model_version',
 
             # Prediction outputs
             'predicted_direction',
@@ -80,7 +82,7 @@ class EnhancedLogger:
                 df.to_csv(filepath, index=False)
 
     def log_prediction(self, timeframe, prediction, current_price,
-                      gate_info=None, trade_info=None):
+                      gate_info=None, trade_info=None, symbol=None, model_version=None):
         """
         Log a comprehensive prediction record.
 
@@ -102,7 +104,10 @@ class EnhancedLogger:
         record = {
             'timestamp': timestamp,
             'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'timeframe': timeframe,
+            'symbol': symbol,
+            'model_version': model_version,
 
             # Predictions
             'predicted_direction': prediction['predicted_direction'],
@@ -166,54 +171,101 @@ class EnhancedLogger:
         df = pd.concat([df, new_df], ignore_index=True, copy=False)
         df.to_csv(filepath, index=False)
 
-    def update_validation(self, timeframe, timestamp, actual_price, actual_direction, outcome):
+    def update_validation_batch(self, timeframe, updates):
         """
-        Update a prediction with validation results.
-
+        Update multiple predictions with validation results in a single read/write op.
+        
         Args:
             timeframe: Which log file to update
-            timestamp: Timestamp of the prediction to update
-            actual_price: Actual price after timeframe elapsed
-            actual_direction: Calculated actual direction
-            outcome: 'GOOD', 'BAD', or 'PERFECT'
+            updates: List of dicts, each containing:
+                     {'timestamp': int, 'actual_price': float, 'actual_direction': str, 'outcome': str}
         """
-        # Update timeframe-specific log
-        self._update_log_file(self.log_files[timeframe], timestamp,
-                             actual_price, actual_direction, outcome)
+        filepath = self.log_files.get(timeframe)
+        if not filepath:
+            filepath = self.log_files['all']
+            
+        self._update_log_file_batch(filepath, updates)
+        
+        # Also update the 'all' log if we didn't just do it
+        if filepath != self.log_files['all']:
+             self._update_log_file_batch(self.log_files['all'], updates)
 
-        # Update combined log
-        self._update_log_file(self.log_files['all'], timestamp,
-                             actual_price, actual_direction, outcome)
-
-    def _update_log_file(self, filepath, timestamp, actual_price, actual_direction, outcome):
-        """Update a specific log file with validation data"""
+    def _update_log_file_batch(self, filepath, updates):
+        """Batch update a specific log file"""
         try:
             try:
                 df = pd.read_csv(filepath)
             except pd.errors.EmptyDataError:
-                # File is empty, nothing to update
                 return
 
-            # Find the prediction
-            mask = df['timestamp'] == timestamp
+            if df.empty:
+                return
 
-            if mask.any():
-                # Calculate price error
-                predicted_price = df.loc[mask, 'predicted_price'].values[0]
-                price_error_pct = ((actual_price - predicted_price) / predicted_price) * 100
+            # Ensure timestamp matching is robust
+            # Convert both to int for comparison
+            # Handle if timestamp is already int or float
+            df['timestamp_int'] = pd.to_numeric(df['timestamp'], errors='coerce').fillna(0).astype(int)
+            
+            # Map updates by timestamp for O(1) lookup
+            update_map = {int(u['timestamp']): u for u in updates}
+            
+            updated = False
+            
+            # Iterate through rows that have updates
+            # Much faster to iterate over the items we want to update if they are sparse
+            # OR iterate over DF if updates are dense. 
+            # Given we are fixing "pending", we iterate the DF rows that match our update keys
+            
+            # Vectorized approach is hard with varying values. 
+            # Let's iterate index for matching rows.
+            
+            # Find indices where timestamp_int is in our update keys
+            mask = df['timestamp_int'].isin(update_map.keys())
+            
+            if not mask.any():
+                return
+                
+            for idx in df[mask].index:
+                ts = df.at[idx, 'timestamp_int']
+                if ts in update_map:
+                    u = update_map[ts]
+                    
+                    try:
+                        predicted_price = float(df.at[idx, 'predicted_price'])
+                        if predicted_price != 0:
+                            price_error_pct = ((u['actual_price'] - predicted_price) / predicted_price) * 100
+                        else:
+                            price_error_pct = 0.0
+                    except:
+                        price_error_pct = 0.0
+                        
+                    df.at[idx, 'actual_price'] = u['actual_price']
+                    df.at[idx, 'actual_direction'] = u['actual_direction']
+                    df.at[idx, 'direction_status'] = u['direction_status']
+                    df.at[idx, 'price_status'] = u.get('price_status', 'PENDING')
+                    df.at[idx, 'price_diff'] = u.get('price_diff', 0.0)
+                    updated = True
+            
+            # Drop temp col
+            df = df.drop(columns=['timestamp_int'])
 
-                # Update fields
-                df.loc[mask, 'actual_price'] = actual_price
-                df.loc[mask, 'actual_direction'] = actual_direction
-                df.loc[mask, 'outcome'] = outcome
-                df.loc[mask, 'price_error_pct'] = price_error_pct
-
-                # Save
+            if updated:
                 df.to_csv(filepath, index=False)
+                
         except Exception as e:
-            print(f"Error updating validation in {filepath}: {e}")
+            print(f"Error batch updating validation in {filepath}: {e}")
+
+    def update_validation(self, timeframe, timestamp, actual_price, actual_direction, outcome):
+        # Wrapper for single update to use batch logic
+        self.update_validation_batch(timeframe, [{
+            'timestamp': int(timestamp),
+            'actual_price': actual_price,
+            'actual_direction': actual_direction,
+            'outcome': outcome
+        }])
 
     def get_stats(self, timeframe='all'):
+
         """
         Get statistics for a specific timeframe.
 

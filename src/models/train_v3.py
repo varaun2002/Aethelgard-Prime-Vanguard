@@ -152,7 +152,7 @@ class TrainerV3:
         logger.info(f"Resampled Dataset Size: {len(X)} -> {len(X_new)}")
         return X_new, y_ret_new, y_dir_new, y_reg_new
 
-        return X_new, y_ret_new, y_dir_new, y_reg_new
+
 
     def get_scalers(self, timeframe):
         """Load or create scalers"""
@@ -190,10 +190,10 @@ class TrainerV3:
         tech_data = np.nan_to_num(tech_data)
         
         # Targets
-        returns = df['log_ret'].shift(-1).fillna(0).values * 100
+        returns = tech_df['log_ret'].shift(-1).fillna(0).values * 100
         
         flat_threshold = 0.0025
-        future_ret = df['log_ret'].shift(-1).fillna(0).values
+        future_ret = tech_df['log_ret'].shift(-1).fillna(0).values
         dirs = []
         for r in future_ret:
             if abs(r) < flat_threshold: dirs.append(0)
@@ -221,14 +221,24 @@ class TrainerV3:
         logger.info("Generating external features (v3.1 with History)...")
         
         hist_fetcher = ExternalHistoryFetcher()
-        spx, vix = hist_fetcher.fetch_stock_history()
-        fng = hist_fetcher.fetch_fear_greed_history()
+        spx, vix, fng = None, None, None
+        spx_idx, vix_idx, fng_idx = None, None, None
+
+        try:
+            logger.info("Fetching SPX/VIX/FNG history...")
+            spx, vix = hist_fetcher.fetch_stock_history()
+            fng = hist_fetcher.fetch_fear_greed_history()
+            
+            # Pre-process indices for fast lookup
+            if spx is not None:
+                spx_idx = spx.index.tz_localize(None)
+                vix_idx = vix.index.tz_localize(None)
+            if fng is not None:
+                fng_idx = fng.index.tz_localize(None)
+        except Exception as e:
+            logger.error(f"Failed to fetch external history: {e}")
         
-        # Pre-process indices for fast lookup
-        if spx is not None:
-            spx_idx = spx.index.tz_localize(None)
-            vix_idx = vix.index.tz_localize(None)
-            fng_idx = fng.index.tz_localize(None)
+        logger.info(f"External Data Fetched: SPX={spx is not None}, VIX={vix is not None}, FNG={fng is not None}")
         
         external_data_list = []
         timestamps = pd.to_datetime(tech_df['timestamp']).astype(np.int64) // 10**9 # seconds
@@ -328,7 +338,7 @@ class TrainerV3:
             torch.LongTensor(np.array(y_reg))
         )
 
-    def train(self, symbol, timeframe, df=None, epochs=50, batch_size=64, learning_rate=0.001, micro_update=False):
+    def train(self, symbol, timeframe, df=None, epochs=50, batch_size=64, learning_rate=0.001, micro_update=False, model_save_path=None, load_existing=True):
         if df is None:
             logger.error("No DataFrame provided for training")
             return
@@ -351,9 +361,6 @@ class TrainerV3:
             logger.warning("Not enough data to train")
             return
             
-        # [Fix #5] Resampling (Only if not micro-updating, or always? Ideally always for balance)
-        # But for micro-updates on small rectent data, resampling might reduce diversity too much. 
-        # Let's apply it mainly for full training.
         if not micro_update:
             try:
                 X, y_ret, y_dir, y_reg = self.resample_training_data(X, y_ret, y_dir, y_reg)
@@ -370,15 +377,18 @@ class TrainerV3:
         model = CryptoModelV3(input_dim=input_dim, vol_dim=vol_dim).to(self.device)
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4) 
         
-        model_path = f"{self.model_dir}/model_v3_0_{timeframe}.pth"
+        if model_save_path is None:
+             model_save_path = f"{self.model_dir}/model_v3_0_{timeframe}.pth"
         
         # Load or Init
-        if os.path.exists(model_path):
+        if load_existing and os.path.exists(model_save_path):
             try:
-                state = torch.load(model_path, map_location=self.device)
+                state = torch.load(model_save_path, map_location=self.device)
                 model.load_state_dict(state)
             except Exception as e:
                 logger.warning(f"Starting fresh model (Load failed: {e})")
+        else:
+             logger.info(f"Starting fresh model (load_existing={load_existing})")
         
         # 4. Training Loop
         model.train()
@@ -400,13 +410,12 @@ class TrainerV3:
                 
                 outputs = model(batch_X)
                 
-                # [Fix #3] Weighted Loss Calculation
                 loss, components = self.calculate_weighted_loss(
                     outputs['regime_logits'], 
                     outputs['direction_logits'], 
                     outputs['predicted_return'],
                     batch_reg, batch_dir, batch_ret,
-                    current_regime_idx=batch_reg # Pass target regime for adaptive weighting during training
+                    current_regime_idx=batch_reg 
                 )
                 
                 loss.backward()
@@ -419,8 +428,179 @@ class TrainerV3:
                 logger.info(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(dataloader):.4f}")
                 
         # 5. Save
-        torch.save(model.state_dict(), model_path)
-        logger.info(f"v3.0 Model saved to {model_path}")
+        torch.save(model.state_dict(), model_save_path)
+        logger.info(f"Model saved to {model_save_path}")
+        
+    def train_walk_forward(self, df, timeframe="15m", train_months=6, val_months=1, test_months=1, epochs=20, limit_folds=None):
+        """
+        Execute Walk-Forward Validation training
+        limit_folds: List of fold indices (1-based) to run.
+        """
+        from src.validation.walk_forward import WalkForwardValidator
+        from sklearn.metrics import accuracy_score
+        from src.backtesting.backtester import Backtester
+        
+        validator = WalkForwardValidator(train_months=train_months, val_months=val_months, test_months=test_months)
+        splits = validator.split_data(df)
+        
+        logger.info(f"Starting Walk-Forward Validation with {len(splits)} splits")
+        
+        all_test_accuracies = []
+        all_profits = []
+        fold_results = []
+        
+        backtester = Backtester(initial_balance=10000)
+        
+        for i, (train_df, val_df, test_df) in enumerate(splits):
+            fold_num = i + 1
+            if limit_folds and fold_num not in limit_folds:
+                continue
+                
+            logger.info(f"\n=== Fold {fold_num}/{len(splits)} ===")
+            logger.info(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+            
+            # 1. Train
+            temp_model_path = f"{self.model_dir}/temp_wf_fold_{i}.pth"
+            
+            # Use load_existing=False to force fresh model for each fold to avoid leaking weights from previous folds
+            # Or should we fine-tune?
+            # Standard WF: Rolling Window usually implies re-training.
+            # Expanding Window implies fine-tuning.
+            # We are using sliding window (WalkForwardValidator default).
+            # So FRESH model is safer/more correct.
+            self.train(symbol="ETH/USDT", timeframe=timeframe, df=train_df, epochs=epochs, batch_size=32, 
+                       model_save_path=temp_model_path, load_existing=False)
+            
+            # 2. Evaluate
+            from src.inference.predict_v3 import PredictorV3
+            predictor = PredictorV3(model_path=temp_model_path)
+            model = predictor.model
+            model.eval()
+            
+            # Re-create sequences for test set
+            try:
+                X_test, y_ret_test, y_dir_test, y_reg_test = self.create_sequences_v3(test_df, timeframe)
+            except Exception as e:
+                logger.error(f"Failed to create test sequences: {e}")
+                continue
+                
+            X_test = X_test.to(self.device)
+            logger.info("Starting inference on X_test...")
+            
+            predictions_for_backtest = []
+            
+            with torch.no_grad():
+                 outputs = model(X_test)
+                 dir_logits = outputs['direction_logits']
+                 probs = torch.softmax(dir_logits, dim=1)
+                 probs_np = probs.cpu().numpy()
+                 pred_indices = torch.argmax(probs, dim=1).cpu().numpy()
+                 confidences = torch.max(probs, dim=1).values.cpu().numpy()
+            
+            # Confidence Analysis
+            avg_conf = np.mean(confidences)
+            max_conf = np.max(confidences)
+            std_conf = np.std(confidences)
+            
+            unique, counts = np.unique(pred_indices, return_counts=True)
+            pred_dist = dict(zip(unique, counts))
+            
+            # Detailed Confidence by Class
+            conf_by_class = {}
+            for cls in unique:
+                 mask = (pred_indices == cls)
+                 conf_by_class[int(cls)] = float(np.mean(confidences[mask]))
+            
+            logger.info(f"Inference Stats | Conf: Mean={avg_conf:.3f}, Max={max_conf:.3f}, Std={std_conf:.3f}")
+            logger.info(f"Prediction Distribution: {pred_dist}")
+            logger.info(f"Confidence by Class: {conf_by_class}")
+            
+            logger.info(f"Inference complete. Predictions: {len(pred_indices)}")
+            
+            try:
+                # ... (rest of the try block) ...
+                if hasattr(y_dir_test, 'cpu'):
+                    actuals = y_dir_test.cpu().numpy()
+                else:
+                    actuals = y_dir_test.numpy()
+
+                acc = 0.0
+                try:
+                    from sklearn.metrics import accuracy_score
+                    acc = accuracy_score(actuals, pred_indices)
+                except Exception as e:
+                    logger.error(f"Accuracy calc failed: {e}")
+                    acc = 0.0
+                
+                all_test_accuracies.append(acc)
+                
+                # Prepare for Backtester
+                logger.info("Aligning data for backtest...")
+                seq_len = 60 # Standard sequence length
+                
+                # Fix alignment: Feature engineering drops rows, so rely on prediction count
+                aligned_df = test_df.iloc[-len(pred_indices):].reset_index(drop=True)
+                logger.info(f"Aligned DF shape: {aligned_df.shape}")
+                
+                mapping = {0: 'FLAT', 1: 'UP', 2: 'DOWN'}
+                
+                for idx in range(len(pred_indices)):
+                    p_idx = pred_indices[idx]
+                    conf = confidences[idx]
+                    signal = mapping.get(p_idx, 'FLAT')
+                    predictions_for_backtest.append({
+                        'signal': signal, 
+                        'confidence': float(conf),
+                        'probs': probs_np[idx].tolist()
+                    })
+                
+                # Run Backtest
+                logger.info("Running Profitability Backtest...")
+                equity_df = backtester.run_backtest(aligned_df, predictions_for_backtest)
+                metrics = backtester.calculate_metrics(equity_df)
+                
+                profit_pct = metrics.get('total_return', 0)
+                all_profits.append(profit_pct)
+                
+                fold_res = {
+                    'fold': i+1,
+                    'accuracy': acc,
+                    'profit_pct': profit_pct,
+                    'max_dd': metrics.get('max_drawdown', 0),
+                    'sharpe': metrics.get('sharpe_ratio', 0),
+                    'start_date': aligned_df['timestamp'].min(),
+                    'end_date': aligned_df['timestamp'].max()
+                }
+                fold_results.append(fold_res)
+                
+                logger.info(f"Fold {i+1} Result: Acc={acc:.1%} | Profit={profit_pct:.1%} | Sharpe={metrics.get('sharpe_ratio',0):.2f}")
+                
+            except Exception as e:
+                logger.error(f"CRITICAL FAILURE in Fold {i+1} post-inference: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                continue
+            
+            # Incremental Save
+            temp_df = pd.DataFrame(fold_results)
+            temp_df.to_csv("data/walk_forward_results.csv", index=False)
+            
+            # Cleanup model
+            if os.path.exists(temp_model_path):
+                try:
+                   os.remove(temp_model_path)
+                except: pass
+    
+        avg_acc = np.mean(all_test_accuracies) if all_test_accuracies else 0
+        avg_profit = np.mean(all_profits) if all_profits else 0
+        total_profit_compounded = np.prod([1+p for p in all_profits]) - 1 if all_profits else 0
+        
+        logger.info(f"\nOverall Walk-Forward Results:")
+        logger.info(f"Average Accuracy: {avg_acc:.2%}")
+        logger.info(f"Avg Monthly Profit: {avg_profit:.2%}")
+        logger.info(f"Total Compounded Return: {total_profit_compounded:.2%}")
+        
+        return fold_results
 
 if __name__ == "__main__":
     import argparse
@@ -428,6 +608,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--test", action="store_true", help="Run in test mode with dummy data")
+    parser.add_argument("--walk_forward", action="store_true", help="Run Walk-Forward Validation")
     args = parser.parse_args()
 
     trainer = TrainerV3()
@@ -435,23 +616,25 @@ if __name__ == "__main__":
     if args.test:
         logger.info("Running in TEST mode")
         # Generate dummy data
-        dates = pd.date_range(start="2023-01-01", periods=1000, freq="15min")
+        dates = pd.date_range(start="2020-01-01", periods=5000, freq="15min") # Need more data for WF
         data = {
             'timestamp': dates.astype(np.int64) // 10**9 * 1000, # ms
-            'open': np.random.rand(1000) * 100 + 1000,
-            'high': np.random.rand(1000) * 100 + 1100,
-            'low': np.random.rand(1000) * 100 + 900,
-            'close': np.random.rand(1000) * 100 + 1000,
-            'volume': np.random.rand(1000) * 1000,
-            'log_ret': np.random.randn(1000) * 0.01
+            'open': np.random.rand(5000) * 100 + 1000,
+            'high': np.random.rand(5000) * 100 + 1100,
+            'low': np.random.rand(5000) * 100 + 900,
+            'close': np.random.rand(5000) * 100 + 1000,
+            'volume': np.random.rand(5000) * 1000,
+            'log_ret': np.random.randn(5000) * 0.01
         }
         df = pd.DataFrame(data)
-        # Ensure log_ret exists (FeatureEngineer might recalculate but we need it for targets)
-        # FeatureEngineer calculates log_ret from close if missing, but we provide it.
         
-        trainer.train(symbol="ETH/USDT", timeframe="15m", df=df, epochs=args.epochs, batch_size=args.batch_size)
+        if args.walk_forward:
+            trainer.train_walk_forward(df, epochs=5, train_months=3, val_months=1, test_months=1)
+        else:
+            trainer.train(symbol="ETH/USDT", timeframe="15m", df=df, epochs=args.epochs, batch_size=args.batch_size)
     else:
         logger.info("Running in REAL mode (Placeholder)")
         # In a real scenario, we would load data here. 
         # For now, we print instructions.
         print("Please provide a dataframe to trainer.train() or run with --test")
+

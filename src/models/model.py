@@ -63,7 +63,7 @@ class CrossAttentionFusion(nn.Module):
         return fused.squeeze(1) # [batch_size, d_model]
 
 class CryptoModelV3(nn.Module):
-    def __init__(self, input_dim=70, vol_dim=0, d_model=128, nhead=4, num_layers=2, dropout=0.2):
+    def __init__(self, input_dim=40, vol_dim=0, d_model=64, nhead=4, num_layers=1, dropout=0.4):
         """
         v2.3 Architecture with Cross-Attention Fusion and Confidence Calibration.
         
@@ -82,7 +82,7 @@ class CryptoModelV3(nn.Module):
         # 2. Context Backbone (Transformer)
         self.embedding = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
-        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, d_model*4, dropout, batch_first=True)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, d_model*2, dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         
         # 3. Volatility Encoder (New in v2.3)

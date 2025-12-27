@@ -186,9 +186,8 @@ def main():
             
             # --- 1. RUN PREDICTION ---
             try:
-                # Predict (Disable Safety Lock for Aggressive)
-                # Force Threshold 0.1: If Regime matches, take ANY directional signal over 10%
-                pred = model.predict(df, safety_lock=False, confidence_threshold=0.38, force_threshold=0.1)
+                # Predict (Standard V3 Call)
+                pred = model.predict(df, safety_lock=False) # remove old aggressive overrides, rely on PaperTrader dynamic logic
                 
                 # --- DISPLAY ---
                 col1, col2, col3 = st.columns(3)
@@ -200,12 +199,6 @@ def main():
                     st.metric("Vanguard Signal", direction, delta_color="normal" if direction == "FLAT" else "inverse")
                 with col3:
                     st.metric("Confidence", f"{pred['confidence']*100:.1f}%")
-
-                # --- AGGRESSIVE FILTER ---
-                # Stop trading on noise (<10%). Fees (0.1%) kill these trades.
-                if pred['confidence'] < 0.1:
-                    direction = "FLAT" # Override 
-                    pred['predicted_direction'] = "FLAT"
 
                 # --- TRADING LOGIC (AGGRESSIVE) ---
                 ts_int = int(time.time())
@@ -219,19 +212,35 @@ def main():
                     'equity': p_stats['current_equity']
                 }
 
-                # Execute Trade (Correct Signature: signal, conf, price, timestamp)
+                # Execute Trade
+                current_volume = df['volume'].iloc[-1]
+                quote_volume = current_volume * current_price
+                
+                # Extract Probs if available (Model Predictor should return them)
+                # Need to verify PredictorV3 returns probs. If not, we might need to update PredictorV3 too.
+                # Assuming PredictorV3.predict returns 'probs' key if we updated it?
+                # Actually we updated TrainerV3.inference, but did we update PredictorV3 class in src/inference/predict_v3.py?
+                # We need to check PredictorV3.predict first.
+                probs = pred.get('probs', None)
+
                 action = trader.update(
                     str(direction), 
                     float(pred['confidence']), 
                     current_price, 
-                    ts_int
+                    ts_int,
+                    recent_prices=df['close'].values,
+                    volume=quote_volume,
+                    recent_candles=df, # Pass DF for Regime Detection
+                    probs=probs
                 )
                 
                 # Log Prediction
                 enhanced_logger.log_prediction(
                     "15m", pred, current_price, 
                     gate_info={'gate1_passed':True, 'gate2_passed':True, 'gate3_applied':False},
-                    trade_info={'signal': direction, 'executed': action is not None}
+                    trade_info={'signal': direction, 'executed': action is not None},
+                    symbol=symbol,
+                    model_version="v3.0 Aggressive"
                 )
                 
                 if action:

@@ -3,10 +3,15 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import time
 import os
+import sys
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.utils.enhanced_logger import EnhancedLogger
 
 class LogValidator:
-    def __init__(self, symbol="BTC-USD"):
+    def __init__(self, symbol="ETH-USD"):
         self.symbol = symbol
         self.logger = EnhancedLogger()
         self.intervals = {
@@ -19,10 +24,6 @@ class LogValidator:
         """Checking all timeframe logs for pending predictions that have matured."""
         print(f"🔍 Validating predictions for {self.symbol}...")
         
-        # 1. Fetch recent data (enough to cover the last 5 days of 15m candles)
-        # Using 15m interval allows us to validate 15m, 1h (4 * 15m), and 4h (16 * 15m) roughly.
-        # But for accuracy, 1h and 4h alignment might vary. 
-        # yfinance 15m data is good.
         try:
             df_price = yf.download(self.symbol, period="5d", interval="15m", progress=False)
             if df_price.empty:
@@ -53,7 +54,7 @@ class LogValidator:
                 except pd.errors.EmptyDataError:
                     continue
                     
-                if 'outcome' not in df_log.columns:
+                if 'direction_status' not in df_log.columns:
                     continue
                     
                 # Filter PENDING
@@ -61,37 +62,33 @@ class LogValidator:
                 if df_log.empty:
                     continue
                     
-                pending_mask = df_log['outcome'] == 'PENDING'
+                pending_mask = df_log['direction_status'] == 'PENDING'
                 if not pending_mask.any():
                     continue
                 
-                # Iterate pending rows
+                # Iterate pending rows and collect updates
+                batch_updates = []
+                
                 for idx, row in df_log[pending_mask].iterrows():
                     try:
-                        pred_ts = int(row['timestamp'])
-                    except ValueError:
-                        continue
-                        
-                    target_ts = datetime.fromtimestamp(pred_ts) + timedelta(minutes=minutes)
-                    
-                    # Check if target time is in the past (with 2 min buffer for data delay)
-                    if target_ts < datetime.now() - timedelta(minutes=2):
-                        # Find closest candle
-                        # We want the candle whose CLOSE matches the target time?
-                        # Or the candle that *starts* at target_ts?
-                        # Usually, if we predict 10:00 -> 10:15. We want Close at 10:15.
-                        # yfinance timestamps are usually start of interval.
-                        # So the candle starting at 10:00 closes at 10:15.
-                        # So we look for index = pred_ts (approx).
-                        # Let's verify closest match.
-                        
-                        target_lookup_ts = datetime.fromtimestamp(pred_ts)
-                        
-                        # Find price at exact lookup timestamp (candle start)
-                        # We want the CLOSE of that candle.
-                        
-                        # Find nearest index
+                        # Robust timestamp conversion
                         try:
+                            # Handle cases where timestamp might be float string
+                            pred_ts = int(float(row['timestamp']))
+                        except:
+                            continue
+                            
+                        target_ts = datetime.fromtimestamp(pred_ts) + timedelta(minutes=minutes)
+                        
+                        # Check if target time is in the past (with 2 min buffer for data delay)
+                        if target_ts < datetime.now() - timedelta(minutes=2):
+                            
+                            target_lookup_ts = datetime.fromtimestamp(pred_ts)
+                            
+                            # Find price at exact lookup timestamp (candle start)
+                            # We want the CLOSE of that candle.
+                            
+                            # Find nearest index
                             # Using nearest match within tolerance
                             idx_loc = df_price.index.get_indexer([target_lookup_ts], method='nearest')[0]
                             match_ts = df_price.index[idx_loc]
@@ -109,22 +106,12 @@ class LogValidator:
                             predicted_price = row.get('predicted_price', 0)
                             current_price_at_pred = row.get('current_price', 0)
                             
-                            # Determine actual direction relative to Entry Price (current_price)
-                            # Or relative to previous close? 
-                            # The model predicts direction from Current Price.
-                            
-                            if current_price_at_pred == 0:
-                                continue # Cannot validate
+                            if pd.isna(current_price_at_pred) or current_price_at_pred == 0:
+                                continue
                                 
                             pct_change = (actual_close - current_price_at_pred) / current_price_at_pred
                             
-                            if abs(pct_change) < 0.001: # 0.1% threshold for FLAT?
-                                actual_dir = "FLAT" # or use model threshold? 
-                                # The model defines direction classes.
-                                # But for outcome, we just want to know if it went UP or DOWN.
-                                # Let's use simple logic:
-                                pass
-                            
+                            # 0.1% threshold for minimal direction
                             if pct_change > 0.001:
                                 actual_dir = "UP"
                             elif pct_change < -0.001:
@@ -132,44 +119,54 @@ class LogValidator:
                             else:
                                 actual_dir = "FLAT"
                                 
-                            # Outcome
-                            outcome = "WRONG"
+                            # Outcome Logic
+                            direction_status = "WRONG"
                             if predicted_dir == actual_dir:
-                                outcome = "CORRECT"
+                                direction_status = "CORRECT"
                             elif predicted_dir == "FLAT":
-                                # If predicted FLAT, and it was FLAT -> Correct
-                                # If predicted FLAT, effectively saved fees.
+                                # If predicted FLAT
                                 if actual_dir == "FLAT":
-                                    outcome = "CORRECT"
+                                    direction_status = "CORRECT" # Correctly predicted noise
                                 else:
-                                    outcome = "WRONG" # Missed move? Or 'SAFE'?
-                                    # Let's call it WRONG for now, or SAFE.
-                                    # Actually, if we predict FLAT, we are neutral.
-                                    # If market moved, we missed it.
-                                    outcome = "MISSED"
+                                    direction_status = "MISSED" # Market moved but we stayed flat (Safe but missed opp)
+                            else:
+                                # Predicted UP/DOWN but got something else
+                                direction_status = "WRONG"
                             
-                            # Update (Using EnhancedLogger logic)
-                            self.logger.update_validation(
-                                timeframe=timeframe,
-                                timestamp=pred_ts,
-                                actual_price=actual_close,
-                                actual_direction=actual_dir,
-                                outcome=outcome
-                            )
-                            updates_count += 1
-                            
-                        except Exception as e:
-                            # print(f"Error validating row {idx}: {e}")
-                            continue
+                            # Price Status Logic
+                            # Hitting predicted price or just direction?
+                            # Let's say if Price Diff % < 0.5% it is accurate
+                            price_diff_val = actual_close - predicted_price
+                            price_status = "MISS"
+                            if abs(pct_change) < 0.005: 
+                                price_status = "HIT"
+
+                            # Add to batch
+                            batch_updates.append({
+                                'timestamp': pred_ts,
+                                'actual_price': actual_close,
+                                'actual_direction': actual_dir,
+                                'direction_status': direction_status,
+                                'price_status': price_status,
+                                'price_diff': price_diff_val
+                            })
+                                
+                    except Exception as e:
+                        continue
+                                
+                # Apply Batch
+                if batch_updates:
+                    self.logger.update_validation_batch(timeframe, batch_updates)
+                    updates_count += len(batch_updates)
+                    print(f"✅ Processed {len(batch_updates)} updates for {timeframe}.")
                             
             except Exception as e:
                 print(f"Error processing {timeframe}: {e}")
                 
         if updates_count > 0:
-            print(f"✅ Updated {updates_count} predictions.")
+            print(f"✨ Total predictions validated: {updates_count}")
         else:
-            # print("No pending predictions matured.")
-            pass
+             pass
 
 if __name__ == "__main__":
     validator = LogValidator()

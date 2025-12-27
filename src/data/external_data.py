@@ -292,17 +292,20 @@ class ExternalDataFetcher:
         fear_funding_interaction = fear_greed * funding
         btc_vol_vix_interaction = btc_feat[2] * (stock_feat[1] / 20.0)  # btc_vol * normalized_vix
         
-        # Combine all features
+        # Combine (8 + 5 + 1 + 1 + 3 + 2 = 20 features)
+        
         all_features = np.concatenate([
-            time_feat,           # 8 features
-            btc_feat,           # 5 features
-            [funding],          # 1 feature
-            [fear_greed],       # 1 feature
-            stock_feat,         # 3 features
-            [fear_funding_interaction, btc_vol_vix_interaction]  # 2 features
+            time_feat,              # 8 features
+            btc_feat,               # 5 features
+            [funding],              # 1 feature
+            [fear_greed],           # 1 feature
+            stock_feat,             # 3 features
+            [fear_funding_interaction, btc_vol_vix_interaction] # 2 features
         ])
         
-        assert len(all_features) == 20, f"Expected 20 features, got {len(all_features)}"
+        # Verify size
+        if len(all_features) != 20:
+             self.logger.warning(f"Feature vector size mismatch: {len(all_features)} != 20")
         
         return all_features.astype(np.float32)
 

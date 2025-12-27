@@ -4,6 +4,10 @@ import pandas as pd
 import joblib
 import re
 import os
+import sys
+# Add project root to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from src.models.model import CryptoModelV3
 from src.data.data_loader import DataLoader
 from src.utils.logger import setup_logger
@@ -11,11 +15,18 @@ from src.utils.logger import setup_logger
 logger = setup_logger("PredictorV3")
 
 class PredictorV3:
-    def __init__(self, model_path, input_dim=70, vol_dim=0, device=None):
+    def __init__(self, model_path, input_dim=None, vol_dim=0, device=None):
         self.model_path = model_path
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.data_loader = DataLoader()
         self.feature_cols = self.data_loader.feature_engineer.get_feature_columns()
+        
+        # Dynamic Input Dim Calculation
+        # Tech features (30) + External features (20) = 50
+        if input_dim is None:
+             self.input_dim = len(self.feature_cols) + 20 
+        else:
+             self.input_dim = input_dim
         
         # Determine timeframe from model path for scalers
         # Expected format: model_v3_0_{timeframe}.pth or model_{timeframe}.pt
@@ -35,7 +46,7 @@ class PredictorV3:
             self.ext_scaler = None
 
         # Load Model
-        self.model = CryptoModelV3(input_dim, vol_dim=vol_dim).to(self.device)
+        self.model = CryptoModelV3(self.input_dim, vol_dim=vol_dim).to(self.device)
         try:
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             self.model.eval()
@@ -48,6 +59,22 @@ class PredictorV3:
         """
         Generates a prediction using Monte Carlo Dropout.
         """
+        # === INPUT VALIDATION ===
+        required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            logger.error(f"Missing required columns: {missing}")
+            return None
+        
+        # Check for sufficient data
+        if len(df) < seq_len + 200:  # Need seq_len + warmup for indicators
+            logger.warning(f"Insufficient data: {len(df)} rows, need {seq_len + 200}")
+            return None
+        
+        # Check for NaN prices
+        if df['close'].isna().any():
+            logger.warning("NaN values in close prices, forward-filling")
+            df['close'] = df['close'].ffill()
         # 1. Feature Engineering (Technical)
         # Using DataLoader's feature engineer logic but we need sequence
         fe = self.data_loader.feature_engineer
@@ -111,12 +138,12 @@ class PredictorV3:
         mc_results = self.model.mc_dropout_predict(X, n_samples=10)
         
         # 4. Parse Results
-        # dir_probs: [1, 3] -> Squeeze to [3]
+        # dir_probs: [Flat, Down, Up]
         dir_probs = mc_results['direction_probs'].cpu().numpy().squeeze() 
-        if dir_probs.ndim == 0: # Handle edge case if single scalar
+        if dir_probs.ndim == 0: 
              dir_probs = np.array([dir_probs])
         
-        predicted_return = mc_results['predicted_return'].item() / 100 # Unscale
+        predicted_return = mc_results['predicted_return'].item() / 100 
         uncertainty = mc_results['direction_uncertainty'].item()
         
         # Classes: 0=FLAT, 1=DOWN, 2=UP
@@ -125,7 +152,7 @@ class PredictorV3:
         
         direction_map = {0: "FLAT", 1: "DOWN", 2: "UP"}
         predicted_direction = direction_map[pred_class]
-        
+
         # 5. Regime (Need this for dynamic threshold)
         with torch.no_grad():
             out = self.model(X)
@@ -135,78 +162,54 @@ class PredictorV3:
         regime_map = {0: "Range Quiet", 1: "Range Noisy", 2: "Trending UP", 3: "Trending DOWN"}
         regime_str = regime_map.get(regime_class, "Unknown")
 
-        # 6. Dynamic Uncertainty Threshold
-        # Trending markets are more predictable -> allow higher uncertainty (lower bar)
-        # Range/Choppy markets are unpredictable -> require lower uncertainty (higher bar)
+        # 6. Safety Gates (Now just "Caution Flags")
+        # We NEVER override to FLAT. We just flag if the move is risky.
+        
+        # Helper: Thresholds (Restored)
         def get_flat_threshold(regime):
             """
             Return uncertainty threshold for FLAT prediction based on market regime.
-            
-            Higher threshold = MORE directional trades (less conservative)
-            Lower threshold = MORE FLAT predictions (more conservative)
-            
             Args:
                 regime: Market regime classification
-                
             Returns:
                 float: Uncertainty threshold (0.18 to 0.30)
             """
             thresholds = {
-                "Trending UP": 0.30,      # High threshold - trends are predictable, allow trading
-                "Trending DOWN": 0.30,    # High threshold - trends are predictable, allow trading
-                "Range Quiet": 0.22,      # Medium threshold - moderate conservatism
-                "Range Noisy": 0.18       # Lower threshold - noisy markets, be more conservative
+                "Trending UP": 0.25,      # High threshold - lowered for sensitivity
+                "Trending DOWN": 0.25,    # High threshold - lowered for sensitivity
+                "Range Quiet": 0.12,      # Hyper Aggressive: Trade on 12% probability
+                "Range Noisy": 0.12       # Hyper Aggressive: Trade on 12% probability
             }
             return thresholds.get(regime, 0.25)  # Default fallback
-            
-        def _validate_thresholds():
-            """Ensure thresholds are in valid range"""
-            test_regimes = ["Trending UP", "Trending DOWN", "Range Quiet", "Range Noisy"]
-            
-            # Print validation table to log/console
-            # Note: We use logger here since this runs inside predict method/class often
-            logger.info("🔍 THRESHOLD VALIDATION")
-            
-            all_valid = True
-            for regime in test_regimes:
-                threshold = get_flat_threshold(regime)
-                
-                # Check range
-                if threshold < 0.15:
-                    logger.warning(f"❌ {regime:15s}: {threshold:.3f} (TOO LOW - should be 0.18-0.30)")
-                    all_valid = False
-                elif threshold > 0.35:
-                    logger.warning(f"⚠️  {regime:15s}: {threshold:.3f} (TOO HIGH - should be 0.18-0.30)")
-                    all_valid = False
-                else:
-                    logger.info(f"✅ {regime:15s}: {threshold:.3f}")
-            
-            if not all_valid:
-                logger.warning("⚠️  WARNING: Some thresholds are outside valid range!")
-            else:
-                logger.info("✅ All thresholds validated successfully!")
-            
-            return all_valid
-            
-        # Run validation once
-        _validate_thresholds()
+        
+        caution_flag = False # Initialize early
 
+        # Dynamic threshold based on regime (Baseline)
         dynamic_threshold = get_flat_threshold(regime_str)
 
-        caution_flag = False
+        # Logic determining final threshold:
+        # If safety_lock is ON, we strict adhere to dynamic_threshold (or tighter).
+        # If safety_lock is OFF (Aggressive), we allow the passed 'uncertainty_threshold' 
+        # to override if it is looser (higher) than dynamic.
+        
+        final_uncertainty_threshold = dynamic_threshold
+        if not safety_lock:
+             # Allow looser threshold if requested
+             final_uncertainty_threshold = max(dynamic_threshold, uncertainty_threshold)
+
         gate1_passed = True
         gate2_passed = True
-        gate3_applied = False
-
-        # Logic:
-        # 1. Epistemic Safety Check: Is model confused?
-        # Three Gates Logic (v2.4.2 Optimization)
-        # Gate 1: Epistemic Uncertainty (Model Disagreement)
-        if uncertainty > dynamic_threshold:
+        gate3_applied = False # Not needed in binary mode
+        
+        # Gate 1: Uncertainty
+        # Using baseline dynamic thresholds just for warning
+        dynamic_threshold = get_flat_threshold(regime_str)
+        
+        if uncertainty > final_uncertainty_threshold:
             predicted_direction = "FLAT"
             caution_flag = True
             gate1_passed = False
-            logger.info(f"Gate 1 (Uncertainty): Blocked ({uncertainty:.4f} > {dynamic_threshold})")
+            logger.info(f"Gate 1 (Uncertainty): Blocked ({uncertainty:.4f} > {final_uncertainty_threshold:.4f})")
 
         else:
             # Gate 2: Minimum Confidence (Aleatoric Strength)
@@ -222,17 +225,16 @@ class PredictorV3:
                 gate2_passed = False
 
             # Gate 3: Trend Forcing (Context Awareness)
-            # If we are in a Trend, and we are FLAT (due to Gate 2 or Model Class 0),
-            # we check if the 'next best' direction is strong enough to trade.
+            # RE-ENABLED with STRICTER threshold (Sweet Spot)
             if regime_str in ["Trending UP", "Trending DOWN"] and predicted_direction == "FLAT":
                 # Check underlying directional probabilities
                 # dir_probs: [FLAT, DOWN, UP]
                 best_dir_idx = np.argmax(dir_probs[1:]) + 1
                 best_dir_conf = dir_probs[best_dir_idx]
 
-                # Only force if the direction has decent backing (e.g. 0.40 margin/prob)
-                # We use a slightly lower bar for Trend Forcing because Context adds weight.
-                FORCE_THRESHOLD = force_threshold
+                # SWEET SPOT: Increase threshold to 0.18 (was 0.1)
+                # This ensures we only force if the signal is genuinely strong, not just noise.
+                FORCE_THRESHOLD = 0.18
 
                 if best_dir_conf > FORCE_THRESHOLD:
                     predicted_direction = direction_map[best_dir_idx]
@@ -247,6 +249,7 @@ class PredictorV3:
             if safety_lock and regime_class == 1 and confidence < 0.47:
                  predicted_direction = "FLAT" # Strict clamp for noise
 
+
         return {
             'predicted_price': df['close'].iloc[-1] * (1 + predicted_return),
             'predicted_return': predicted_return,
@@ -255,6 +258,7 @@ class PredictorV3:
             'uncertainty': float(uncertainty),
             'regime': regime_str,
             'probabilities': dir_probs.tolist(),
+            'probs': dir_probs.tolist(), # Shortcut for Dashboard
             'caution': caution_flag,
             'gate_info': {
                 'gate1_passed': gate1_passed,
@@ -264,6 +268,8 @@ class PredictorV3:
         }
 
 if __name__ == "__main__":
+    import sys
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Run in test mode")

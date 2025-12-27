@@ -37,7 +37,8 @@ class FeatureEngineerV2:
         df['atr_60'] = ta.atr(df['high'], df['low'], df['close'], length=60) # v2.2: For Volatility Gate
         
         # ATR Rank (Percentile of current ATR vs last 100)
-        df['atr_rank'] = df['atr'].rolling(window=100).rank(pct=True)
+        # Fix: Shift rolling window
+        df['atr_rank'] = df['atr'].rolling(window=100).rank(pct=True).shift(1)
         
         # Bollinger Bands Width
         bb = ta.bbands(df['close'], length=20, std=2)
@@ -52,7 +53,8 @@ class FeatureEngineerV2:
         
         # Historical Volatility (Log Returns Std Dev)
         df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        df['hist_vol'] = df['log_ret'].rolling(window=20).std()
+        # Fix: Shift rolling window
+        df['hist_vol'] = df['log_ret'].rolling(window=20).std().shift(1)
         
         # --- 2. Momentum & Trend Indicators (New v2.3) ---
         # RSI & RSI Slope
@@ -61,9 +63,10 @@ class FeatureEngineerV2:
             df['rsi_slope'] = df['rsi'].diff(3)
             
             # [NEW v2.4] RSI Divergence
+            # Fix: Shift PCA/correlation calc
             price_mom = df['close'].pct_change(5)
             rsi_mom = df['rsi'].pct_change(5)
-            df['rsi_divergence'] = (price_mom - (rsi_mom / 100)).rolling(3).mean()
+            df['rsi_divergence'] = (price_mom - (rsi_mom / 100)).rolling(3).mean().shift(1)
         else:
             df['rsi'] = 0
             df['rsi_slope'] = 0
@@ -102,7 +105,7 @@ class FeatureEngineerV2:
         # --- 3. Candle Features ---
         df['body_size'] = abs(df['close'] - df['open'])
         df['wick_upper'] = df['high'] - np.maximum(df['open'], df['close'])
-        df['wick_lower'] = np.minimum(df['open'], df['close'])
+        df['wick_lower'] = np.minimum(df['open'], df['close']) - df['low']
         df['body_perc'] = df['body_size'] / (df['high'] - df['low'] + 1e-9)
         
         # [NEW v2.4] HL Ratio (Volatility Microstructure)
@@ -110,8 +113,9 @@ class FeatureEngineerV2:
         
         # --- 4. Volume Indicators ---
         # Volume Z-Score
-        vol_mean = df['volume'].rolling(window=20).mean()
-        vol_std = df['volume'].rolling(window=20).std()
+        # Fix: Shift rolling stats
+        vol_mean = df['volume'].rolling(window=20).mean().shift(1)
+        vol_std = df['volume'].rolling(window=20).std().shift(1)
         df['vol_z'] = (df['volume'] - vol_mean) / (vol_std + 1e-9)
         
         # Relative Volume (RVOL)
@@ -129,15 +133,17 @@ class FeatureEngineerV2:
         
         # --- 5. Market Structure ---
         # Rolling Mean/Std
-        df['roll_mean_20'] = df['close'].rolling(window=20).mean()
-        df['roll_std_20'] = df['close'].rolling(window=20).std()
+        # Fix: Shift rolling stats
+        df['roll_mean_20'] = df['close'].rolling(window=20).mean().shift(1)
+        df['roll_std_20'] = df['close'].rolling(window=20).std().shift(1)
         
         # Trend Angle (Slope of last 5 closes)
         df['trend_slope'] = (df['close'] - df['close'].shift(5)) / 5
         
         # [NEW v2.4] Distance from Support/Resistance (52 period High/Low)
-        df['dist_52_high'] = (df['high'].rolling(52).max() - df['close']) / (df['close'] + 1e-9)
-        df['dist_52_low'] = (df['close'] - df['low'].rolling(52).min()) / (df['close'] + 1e-9)
+        # Fix: Shift rolling window (using past 52 periods, not including current)
+        df['dist_52_high'] = (df['high'].rolling(52).max().shift(1) - df['close']) / (df['close'] + 1e-9)
+        df['dist_52_low'] = (df['close'] - df['low'].rolling(52).min().shift(1)) / (df['close'] + 1e-9)
         
         # --- 6. Normalization (Z-Score) ---
         features_to_norm = [
@@ -153,8 +159,14 @@ class FeatureEngineerV2:
         for col in features_to_norm:
             if col in df.columns:
                 # v2.2: Increased window to 180 for stability
-                mean = df[col].rolling(window=180).mean()
-                std = df[col].rolling(window=180).std()
+                # Fix: Look-Ahead Bias - Shift stats by 1
+                mean = df[col].rolling(window=180).mean().shift(1)
+                std = df[col].rolling(window=180).std().shift(1)
+                
+                # Forward-fill the first NaN from shift to avoid initial data loss equivalent to window size
+                mean = mean.ffill().fillna(0)
+                std = std.ffill().fillna(1e-9)
+                
                 df[f'{col}_norm'] = (df[col] - mean) / (std + 1e-9)
                 
                 # Fill NaNs in normalized columns with 0 (mean)
@@ -170,23 +182,26 @@ class FeatureEngineerV2:
         Returns the list of feature column names used for training.
         """
         return [
-            'log_ret', 
-            'atr_norm', 'atr_1_norm', 'atr_3_norm', 'atr_rank',
-            'bb_width_norm', 'hist_vol_norm', 
-            'rsi_norm', 'rsi_slope_norm', 'adx_norm', 'chop_norm', 'aroon_osc_norm',
-            'macd_norm', 'macd_hist_norm', 
+            # 1. Volatility (6)
+            'atr_norm', 'atr_rank', 'bb_width_norm', 'hist_vol_norm', 'vol_z_norm', 'rvol_norm',
+            
+            # 2. Momentum (8)
+            'rsi_norm', 'rsi_slope_norm', 'rsi_divergence_norm', 
+            'adx_norm', 'chop_norm', 'aroon_osc_norm', 'macd_norm', 'macd_hist_norm',
+            
+            # 3. Oscillators (2)
             'stoch_k_norm', 'stoch_d_norm',
-            'body_perc', 
-            'vol_z_norm', 'vol_delta_norm', 'rvol_norm',
-            'trend_slope_norm',
-            'rsi_divergence_norm', 'hl_ratio_norm', 'cvd_norm_raw_norm', 
+            
+            # 4. Price/Candle (6)
+            'log_ret', 'body_perc', 'hl_ratio_norm', 'trend_slope_norm',
             'dist_52_high_norm', 'dist_52_low_norm',
-            # Added raw/other indicators to reach 50 features
-            'dmp', 'dmn', 'aroon_up', 'aroon_down', 'macd_signal', 'macd',
-            'rsi', 'adx', 'chop', 'stoch_k', 'stoch_d',
-            'wick_upper', 'wick_lower', 'body_size',
-            'atr', 'bb_width', 'hist_vol', 'vol_z', 'rvol',
-            'hl_ratio', 'cvd', 'dist_52_high', 'dist_52_low', 'trend_slope'
+            
+            # 5. Volume/Flow (4)
+            'vol_delta_norm', 'cvd_norm_raw_norm', 
+            'wick_upper', 'wick_lower',
+            
+            # 6. Raw Backups (4) - to reach 30
+            'rsi', 'adx', 'atr', 'bb_width'
         ]
 
 # Backward Compatibility

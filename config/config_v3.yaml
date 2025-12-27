@@ -1,16 +1,20 @@
 version: "3.0"
 
 features:
-  technical_features: 50
+  technical_features: 30
   external_features: 20
-  total_features: 70
+  total_features: 50
 
 model:
   architecture: "HybridTransformerGRU"
-  input_dim: 70
-  hidden_dim: 128
-  num_layers: 2
-  dropout: 0.2
+  input_dim: 50
+  hidden_dim: 64
+  num_layers: 1
+  dropout: 0.4
+  
+  # Regularization
+  weight_decay: 0.0001
+  gradient_clip: 1.0
 
 external_data:
   cache_duration:
