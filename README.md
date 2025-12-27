@@ -1,6 +1,11 @@
-# Aethelgard: Prime & Vanguard
+# Aethelgard: Prime & Vanguard (v3.3 Optimized)
 
 Aethelgard is an advanced cryptocurrency trading bot ecosystem powered by Hybrid Transformer-GRU models. It features two distinct trading strategies/configurations: **Prime** and **Vanguard**.
+
+## 🚀 Recent Updates (v3.3)
+*   **Optimized Vanguard Threshold**: Tuned to **0.24** to filter market noise while capturing verified trends.
+*   **Automated Validation**: Integrated `HealthMonitor` now validates predictions against real market data every minute.
+*   **Stability**: Fixed critical bugs including "Probability Swap" and dashboard state crashes.
 
 ## 🔮 Aethelgard Prime
 **Dashboard**: `dashboard/dashboard.py`
@@ -15,13 +20,13 @@ Prime is the flagship configuration, designed for balanced trading with robust r
 **Timeframe**: 15m
 
 Vanguard is the aggressive counterpart, tuned for the 15-minute timeframe. It features:
-- **Lower Confidence Thresholds**: Configurable thresholds to capture earlier trend entries.
-- **Trend Forcing**: A mechanism to override "FLAT" signals when the market regime is clearly trending, allowing for more active participation.
-- **Aggressive Filtering**: Optimized for higher frequency trading while maintaining a safety net against pure noise.
+- **Optimized Confidence**: 0.24 threshold (up from 0.12) to balance frequency and accuracy.
+- **Trend Forcing**: A mechanism to override "FLAT" signals when the market regime is clearly trending.
+- **Automated Health Monitoring**: Self-healing logs and real-time accuracy tracking.
 
 ---
 
-## Technical Architecture (V3.0)
+## Technical Architecture (V3.3)
 
 Both bots share the core V3.0 architecture:
 *   **Model**: Hybrid Transformer-GRU with 70 input features.
@@ -39,14 +44,13 @@ Both bots share the core V3.0 architecture:
     pip install -r requirements.txt
     ```
 
-2.  **Run Prime Dashboard**:
+2.  **Run Vanguard (Ready for Live Testing)**:
     ```bash
-    streamlit run dashboard/dashboard.py
-    ```
-
-3.  **Run Vanguard (Aggressive) Dashboard**:
-    ```bash
+    # Start Dashboard
     streamlit run dashboard/dashboard_15m_aggressive.py
+    
+    # Start Health & Validation Monitor (in separate terminal)
+    python3 scripts/health_monitor.py
     ```
 
 ## Project Structure
@@ -56,3 +60,4 @@ Both bots share the core V3.0 architecture:
 *   `dashboard`: Streamlit dashboards for Prime and Vanguard.
 *   `data`: Historical data and active portfolio state.
 *   `logs`: Transaction logs and prediction history.
+*   `scripts`: Utilities for monitoring, validation, and data management.
